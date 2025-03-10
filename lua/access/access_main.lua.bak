@@ -1,0 +1,139 @@
+local get_conf = require "get_conf"
+local timestamp_rule = require "timestamp_rule"
+local ip_rule = require "ip_rule"
+local zone_rule = require "zone_rule"
+
+--[[
+1. 获取域名的配置
+2. 判断是否在时间段内
+3. 走deny_logic（），如果有精确匹配，则放行/封禁
+4. 判断地域。
+--]]
+local function Query_ip(ip)
+    local cached_info = Lcache:get(ip)
+    if cached_info then
+       return  cached_info
+    end
+
+    if not Geo.initted() then
+        Geo.init("/usr/local/openresty/nginx/GeoLite2-City.mmdb")
+    end
+    local res,err = Geo.lookup(ip)
+    if not res then
+        return "none"
+    end
+    local expiration_time = 86400
+    Lcache:set(ip, res, expiration_time)
+    ngx.log(ngx.DEBUG, "cached IP info for", ip)
+    return res
+end
+
+local function  response_content(reason,ip_list)
+    ngx.status = 403
+    ngx.header["Content-Type"] = "text/html; charset=utf-8"
+
+-- 获取用户 IP 和 User-Agent
+    local user_ip = ngx.var.remote_addr
+    local user_agent = ngx.var.http_user_agent or "-"
+    local ownership = {}
+    for _,ip in ipairs (ip_list) do
+        local country = "none"
+        local subdivisions = "none"
+        local city = "none"
+        res = Query_ip(ip)
+        if res and res ~= "none" then
+            if res.country then
+                country = res.country.names["zh-CN"]
+            end
+            if res.subdivisions then
+                subdivisions = res.subdivisions[1].names["zh-CN"]
+            end
+            if res.city then
+                city = res.city.names["zh-CN"]
+            end
+            table.insert(ownership, "IP: "..ip.. "; country：".. country.. ";subdivisions：".. subdivisions.. ";city:".. city.. "\n")
+        else
+            table.insert(ownership,"IP: ".. ip.. ";none \n")
+        end
+    end
+    local result = table.concat(ownership, "\n ")
+    ngx.log(ngx.ERR, type(result))
+    -- 输出 HTML 内容
+    ngx.say([[
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>用户信息</title>
+    <style>
+        body {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh; /* 使 body 占满整个视口高度 */
+            margin: 0; /* 去除默认的 body 边距 */
+            font-family: Arial, sans-serif;
+            background-color: #f0f0f0;
+        }
+        .centered-text {
+            text-align: center;
+            background-color: #fff;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+        }
+        .centered-text h1 {
+            font-size: 24px;
+            color: #333;
+        }
+        .centered-text p {
+            font-size: 18px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="centered-text">
+        <h1>Access denied: </h1>
+        <img src="https://1416018124.github.io/k3s%E9%9B%86%E7%BE%A4%E9%83%A8%E7%BD%B2/image-20250121223948569.png" >
+        <p>服务不可用</p>
+        <p>很遗憾，该服务目前仅在特定区域可用,如果您认为收到此消息有误,请联系支持.
+        <p>Unfortunately</p>
+        <p>this service is only available in certain regions right now, Please contact support if you believe you are receiving this message in error.</p>
+        <p>]] .. user_ip .. [[</p>
+        <p>]] .. user_agent .. [[</p>
+        <p>]] .. result .. [[</p>
+    </div>
+</body>
+</html>
+]])
+end
+
+local denyConf = get_conf.get_deny()
+if denyConf ~= nil then
+    local res = timestamp_rule.timestamp_logic(denyConf)
+    if res then
+        local ipres,ip_list = ip_rule.ip_logic(denyConf)
+        ngx.var.acl_type = denyConf.acl_type
+        if ipres == "pending" then
+            local zoneres,ip_list = zone_rule.zone_logic(denyConf)
+            if zoneres  == "deny" then
+                ngx.var.result = "zone_deny"
+                response_content("zone_deny", ip_list)
+            else
+                if denyConf.acl_type == "allow" then
+                    ngx.var.result = "zone_allow"
+                else
+                    ngx.var.result = "pass"
+                end
+            end 
+            
+        elseif ipres == "deny" then
+            ngx.var.result = res
+                ngx.var.result = "ip_deny"
+                response_content("ip_deny", ip_list)
+        else 
+            ngx.var.result = "ip_allow"
+        end
+    end
+end

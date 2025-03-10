@@ -1,0 +1,96 @@
+local redis = require "resty.redis"
+local _M = {}
+
+local function ip_to_int(ip)
+    local int = 0
+    for part in string.gmatch(ip, "%d+") do
+        int = int * 256 + tonumber(part)
+    end
+    return int
+end
+
+local function is_zone_allowed(ips, denyConf)
+    if #ips == 0 then
+        return false
+    end
+    for _, ip in ipairs(ips) do
+        local red = redis:new()
+        -- 连接 Redis
+        local ok, err = red:connect("172.17.0.1", 6379)
+        if not ok then
+            ngx.log(ngx.ERR, "Failed to connect to Redis: ", err)
+            return
+        end
+
+        local client_ip_int = ip_to_int(ip)
+        ngx.log(ngx.ERR, client_ip_int)
+
+        -- 使用 ZRANGEBYSCORE 查找匹配的 CIDR 块
+        local cidrs, err = red:zrangebyscore('geolite:ip_range', '-inf', client_ip_int, 'WITHSCORES', 'LIMIT', 0, 1)
+        if not cidrs then
+            ngx.log(ngx.ERR, "Failed to query Redis: ", err)
+            return
+        end
+
+        -- 检查是否找到匹配的 CIDR 块
+        if #cidrs > 0 then
+            local cidr_info = cidrs[1]
+            local cidr = cidr_info:match("([^:]+)")
+            local location = cidr_info:match(":(.+)")
+
+            -- 检查客户端 IP 是否在 CIDR 范围内
+            local iputils = require "resty.iputils"
+            iputils.enable_lrucache()
+            local ipv4_network = iputils.parse_cidr(cidr)
+            if iputils.ip_in_cidr(ip, ipv4_network) then
+                ngx.say("IP 地理位置: ", location)
+                return
+            end
+        end
+
+        ngx.say("未找到 IP 地理位置")
+    end
+end
+
+function _M.zone_logic(denyConf)
+    -- 获取客户端 IP
+    local client_ip = ngx.var.remote_addr
+    local real_ip = ngx.var.http_x_real_ip             -- X-Real-IP 头中的 IP
+    local forwarded_for = ngx.var.http_x_forwarded_for -- X-Forwarded-For 头中的 IP 列表
+
+    local ip_list = {}
+    -- remote_addr,http_x_forwarder_for,http_x_real_ip
+    for _, ip_type in ipairs(denyConf.check_ip) do
+        if ip_type == "remote_addr" then
+            table.insert(ip_list, client_ip)
+        elseif ip_type == "real_ip" then
+            table.insert(ip_list, real_ip)
+        elseif ip_type == "http_x_forwarder_for" then
+            if forwarded_for and forwarded_for ~= "" then
+                -- 按逗号分隔字符串
+                for ip in string.gmatch(forwarded_for, "[^,]+") do
+                    -- 去除 IP 两端的空格（如果有）
+                    ip = string.gsub(ip, "^%s*(.-)%s*$", "%1")
+                    -- 将 IP 添加到列表中
+                    table.insert(ip_list, ip)
+                end
+            end
+        end
+    end
+
+    -- 检查客户端 IP 是否在list范围内
+    if is_zone_allowed(ip_list, denyConf) then
+        if denyConf.acl_type == "deny" then
+            ngx.status = 403
+            ngx.say("Access denied: IP not allowed.")
+            ngx.exit(ngx.HTTP_FORBIDDEN)
+        else
+            ngx.log(ngx.ERR, "allow")
+            return "allow"
+        end
+    end
+    ngx.log(ngx.ERR, "pending")
+    return "pending"
+end
+
+return _M
